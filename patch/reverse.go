@@ -11,6 +11,11 @@ func Reverse(p *diff.Patch) *diff.Patch {
 	r := &diff.Patch{
 		OldFile: p.NewFile,
 		NewFile: p.OldFile,
+		OldEOL:  p.NewEOL,
+		NewEOL:  p.OldEOL,
+
+		OldNoFinalNL: p.NewNoFinalNL,
+		NewNoFinalNL: p.OldNoFinalNL,
 	}
 	for _, h := range p.Hunks {
 		rh := &diff.Hunk{
@@ -20,11 +25,13 @@ func Reverse(p *diff.Patch) *diff.Patch {
 			NewLines: h.OldLines,
 		}
 		for _, l := range h.Lines {
+			// NoNewline belongs to the line's side; swapping add/delete keeps
+			// the marker attached to the same physical content.
 			switch l.Op {
 			case diff.OpAdd:
-				rh.Lines = append(rh.Lines, diff.Line{Op: diff.OpDelete, Text: l.Text})
+				rh.Lines = append(rh.Lines, diff.Line{Op: diff.OpDelete, Text: l.Text, NoNewline: l.NoNewline})
 			case diff.OpDelete:
-				rh.Lines = append(rh.Lines, diff.Line{Op: diff.OpAdd, Text: l.Text})
+				rh.Lines = append(rh.Lines, diff.Line{Op: diff.OpAdd, Text: l.Text, NoNewline: l.NoNewline})
 			default:
 				rh.Lines = append(rh.Lines, l)
 			}

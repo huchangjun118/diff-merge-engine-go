@@ -2,6 +2,7 @@ package patch
 
 import (
 	"strings"
+	"unicode/utf8"
 
 	"github.com/huchangjun118/diff-merge-engine-go/derr"
 	"github.com/huchangjun118/diff-merge-engine-go/diff"
@@ -31,19 +32,37 @@ func (o *ApplyOptions) withDefaults() ApplyOptions {
 }
 
 // Apply applies patch to content and returns the resulting content.
-// On failure the original content is returned unchanged (no partial writes).
+//
+// The output is rendered in the patch's declared line-ending style and
+// trailing-newline state, never in the target's own style.
+//
+// On any failure (malformed state, encoding mismatch, out-of-bounds range,
+// ambiguous or missing context) the original content is returned unchanged:
+// the result string is only produced after every hunk has been located and
+// spliced in memory, so there is never a partially applied file.
 func Apply(content string, p *diff.Patch, opts ApplyOptions) (string, error) {
+	if p == nil {
+		return content, derr.New(derr.KindMalformedPatch, "nil patch")
+	}
+	if !utf8.ValidString(content) {
+		return content, derr.New(derr.KindEncodingMismatch, "target content is not valid UTF-8")
+	}
+	if err := validateForApply(p); err != nil {
+		return content, err
+	}
 	opts = opts.withDefaults()
 	lines := diff.SplitLines(content)
 	result := make([]string, len(lines))
 	copy(result, lines)
-	hadTrailingNewline := strings.HasSuffix(content, "\n")
 
 	offset := 0
 	for hi, h := range p.Hunks {
+		if eb := checkBounds(len(lines), h, opts.MaxOffset); eb != nil {
+			return content, derr.Wrap(eb.Kind, "hunk "+itoa(hi), eb)
+		}
 		pos, coreStart, coreEnd, err := locateHunk(result, h, offset, opts)
 		if err != nil {
-			return content, derr.Wrap(derr.Kind(errKind(err)), "hunk "+itoa(hi), err)
+			return content, derr.Wrap(errKind(err), "hunk "+itoa(hi), err)
 		}
 		// Build replacement lines from the core hunk lines.
 		var replacement []string
@@ -71,13 +90,62 @@ func Apply(content string, p *diff.Patch, opts ApplyOptions) (string, error) {
 		offset += len(replacement) - oldLen
 		result = newResult
 	}
-	joined := diff.JoinLines(result)
-	// Preserve the input's trailing-newline property. An empty input has no
-	// prior line structure, so the output keeps its natural trailing newline.
-	if !hadTrailingNewline && len(lines) > 0 && joined != "" {
-		joined = strings.TrimSuffix(joined, "\n")
+	return diff.RenderLines(result, p.NewEOL, p.NewNoFinalNL), nil
+}
+
+// validateForApply rejects structurally impossible patches up front.
+func validateForApply(p *diff.Patch) error {
+	for hi, h := range p.Hunks {
+		if h.OldLines < 0 || h.NewLines < 0 || h.OldStart < 0 || h.NewStart < 0 {
+			return derr.New(derr.KindOutOfBounds, "hunk "+itoa(hi)+": negative range")
+		}
+		oc, nc := 0, 0
+		for _, l := range h.Lines {
+			switch l.Op {
+			case diff.OpContext:
+				oc++
+				nc++
+			case diff.OpAdd:
+				nc++
+			case diff.OpDelete:
+				oc++
+			default:
+				return derr.New(derr.KindMalformedPatch, "hunk contains invalid op")
+			}
+		}
+		if oc != h.OldLines || nc != h.NewLines {
+			return derr.New(derr.KindMalformedPatch, "hunk counts disagree with body")
+		}
 	}
-	return joined, nil
+	return nil
+}
+
+// checkBounds distinguishes "the patch references content the target cannot
+// contain" (KindOutOfBounds) from "the context does not match"
+// (KindNoMatch). A hunk is out of bounds when even placing it at the most
+// favorable position allowed by maxOffset cannot fit its old range into the
+// target.
+func checkBounds(targetLen int, h *diff.Hunk, maxOffset int) *derr.Error {
+	if h.OldLines == 0 {
+		// Pure insertion: its anchor (lines preceding insertion) must be
+		// reachable within tolerance.
+		if h.OldStart-maxOffset > targetLen {
+			return derr.New(derr.KindOutOfBounds, "insertion point beyond content length")
+		}
+		return nil
+	}
+	start := h.OldStart - 1 // 0-based declared start
+	if start < 0 {
+		start = 0
+	}
+	earliest := start - maxOffset
+	if earliest < 0 {
+		earliest = 0
+	}
+	if earliest+h.OldLines > targetLen {
+		return derr.New(derr.KindOutOfBounds, "hunk range exceeds content length")
+	}
+	return nil
 }
 
 // locateHunk finds the target index where h applies. It returns the start

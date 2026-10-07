@@ -18,10 +18,16 @@ type Conflict struct {
 
 // MergeResult is the outcome of a three-way merge.
 type MergeResult struct {
-	Content         []string // merged content (conflicts rendered with markers)
-	Conflicts       []Conflict
-	Clean           bool
-	trailingNewline bool
+	Content   []string // merged content (conflicts rendered with markers)
+	Conflicts []Conflict
+	Clean     bool
+	// TrailingNewline reports whether the merged content ends with a
+	// newline. It follows the changed sides; when neither side changed the
+	// ending state, the base state is kept.
+	TrailingNewline bool
+	// TrailingEOL is the line-ending style to use when rendering Content.
+	// The latest changed side wins; when neither side changed, base wins.
+	TrailingEOL diff.EOL
 }
 
 // hunk is a change region in base and version coordinates (0-based, half-open).
@@ -80,7 +86,38 @@ func Merge(base, ours, theirs string) *MergeResult {
 		content = append(content, ">>>>>>> theirs")
 	}
 
-	return &MergeResult{Content: content, Conflicts: conflicts, Clean: clean, trailingNewline: strings.HasSuffix(base, "\n")}
+	oursNL := !diff.NoFinalNewline(ours)
+	theirsNL := !diff.NoFinalNewline(theirs)
+	baseNL := !diff.NoFinalNewline(base)
+	trailingNL := baseNL
+	switch {
+	case oursNL != baseNL && theirsNL != baseNL:
+		trailingNL = oursNL // both changed; deterministic pick
+	case oursNL != baseNL:
+		trailingNL = oursNL
+	case theirsNL != baseNL:
+		trailingNL = theirsNL
+	}
+	oursEOL := diff.DetectEOL(ours)
+	theirsEOL := diff.DetectEOL(theirs)
+	baseEOL := diff.DetectEOL(base)
+	trailingEOL := baseEOL
+	switch {
+	case oursEOL != baseEOL && theirsEOL != baseEOL:
+		trailingEOL = oursEOL
+	case oursEOL != baseEOL:
+		trailingEOL = oursEOL
+	case theirsEOL != baseEOL:
+		trailingEOL = theirsEOL
+	}
+
+	return &MergeResult{
+		Content:         content,
+		Conflicts:       conflicts,
+		Clean:           clean,
+		TrailingNewline: trailingNL,
+		TrailingEOL:     trailingEOL,
+	}
 }
 
 // diffHunks computes change hunks between base and ver.
@@ -221,14 +258,21 @@ func equalLines(a, b []string) bool {
 	return true
 }
 
-// String renders the merged content with conflict markers.
+// String renders the merged content with conflict markers using the merge's
+// resolved line-ending style.
 func (r *MergeResult) String() string {
+	return r.Render(r.TrailingEOL)
+}
+
+// Render serializes the merged lines in the given EOL style, honoring the
+// resolved trailing-newline state.
+func (r *MergeResult) Render(eol diff.EOL) string {
 	if len(r.Content) == 0 {
 		return ""
 	}
-	s := strings.Join(r.Content, "\n")
-	if r.trailingNewline {
-		s += "\n"
+	s := strings.Join(r.Content, eol.Sep())
+	if r.TrailingNewline {
+		s += eol.Sep()
 	}
 	return s
 }

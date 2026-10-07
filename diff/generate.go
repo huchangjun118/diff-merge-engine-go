@@ -19,6 +19,32 @@ func SplitLines(content string) []string {
 	return lines
 }
 
+// DetectEOL reports the dominant line-ending style of content. Mixed content
+// is classified by its first line terminator; content without any terminator
+// is EOLDefault.
+func DetectEOL(content string) EOL {
+	if i := strings.IndexByte(content, '\n'); i >= 0 {
+		if i > 0 && content[i-1] == '\r' {
+			return EOLCRLF
+		}
+		return EOLLF
+	}
+	if strings.IndexByte(content, '\r') >= 0 {
+		return EOLCRLF
+	}
+	return EOLDefault
+}
+
+// NoFinalNewline reports whether content is non-empty and does not end with a
+// line terminator (LF or CR).
+func NoFinalNewline(content string) bool {
+	if content == "" {
+		return false
+	}
+	last := content[len(content)-1]
+	return last != '\n' && last != '\r'
+}
+
 // JoinLines joins lines with '\n', appending a trailing newline.
 func JoinLines(lines []string) string {
 	if len(lines) == 0 {
@@ -27,13 +53,108 @@ func JoinLines(lines []string) string {
 	return strings.Join(lines, "\n") + "\n"
 }
 
+// RenderLines serializes lines using the given EOL style. If noFinalNL is
+// true (and there is at least one line) the final line has no terminator.
+func RenderLines(lines []string, eol EOL, noFinalNL bool) string {
+	if len(lines) == 0 {
+		return ""
+	}
+	sep := eol.Sep()
+	s := strings.Join(lines, sep)
+	if !noFinalNL {
+		s += sep
+	}
+	return s
+}
+
 // Generate produces a Patch between oldContent and newContent.
 // contextLines controls how many unchanged lines surround each hunk.
 func Generate(oldContent, newContent string, contextLines int) *Patch {
 	oldLines := SplitLines(oldContent)
 	newLines := SplitLines(newContent)
 	ops := myers(oldLines, newLines)
-	return buildPatch(oldLines, newLines, ops, contextLines)
+	p := buildPatch(oldLines, newLines, ops, contextLines)
+	p.OldEOL = DetectEOL(oldContent)
+	p.NewEOL = DetectEOL(newContent)
+	p.OldNoFinalNL = NoFinalNewline(oldContent)
+	p.NewNoFinalNL = NoFinalNewline(newContent)
+	markNoNewline(p, oldLines, newLines, contextLines)
+	return p
+}
+
+// markNoNewline sets the NoNewline flags on the final lines of the last hunk
+// when it reaches EOF. When the line sequences are identical but only the
+// trailing-newline state differs (a change that otherwise produces an empty
+// diff), it synthesizes a one-line hunk expressing that change so it is not
+// lost.
+func markNoNewline(p *Patch, oldLines, newLines []string, context int) {
+	if len(p.Hunks) > 0 {
+		h := p.Hunks[len(p.Hunks)-1]
+		touchesOld := h.OldStart >= 0 && h.OldStart-1+h.OldLines == len(oldLines)
+		touchesNew := h.NewStart >= 0 && h.NewStart-1+h.NewLines == len(newLines)
+		if touchesOld && touchesNew {
+			// A common final context line whose newline presence changed must
+			// be rendered as -/+ so each side can carry its own marker.
+			if p.OldNoFinalNL != p.NewNoFinalNL && len(h.Lines) > 0 {
+				last := &h.Lines[len(h.Lines)-1]
+				if last.Op == OpContext {
+					text := last.Text
+					*last = Line{Op: OpDelete, Text: text, NoNewline: p.OldNoFinalNL}
+					h.Lines = append(h.Lines, Line{Op: OpAdd, Text: text, NoNewline: p.NewNoFinalNL})
+					return
+				}
+			}
+		}
+		if touchesOld {
+			for i := len(h.Lines) - 1; i >= 0; i-- {
+				if h.Lines[i].Op == OpContext || h.Lines[i].Op == OpDelete {
+					h.Lines[i].NoNewline = p.OldNoFinalNL
+					break
+				}
+			}
+		}
+		if touchesNew {
+			for i := len(h.Lines) - 1; i >= 0; i-- {
+				if h.Lines[i].Op == OpContext || h.Lines[i].Op == OpAdd {
+					h.Lines[i].NoNewline = p.NewNoFinalNL
+					break
+				}
+			}
+		}
+		return
+	}
+
+	// Identical line sequences: a hunk is only required when the
+	// trailing-newline presence changed on non-empty content. Pure EOL
+	// style changes are expressed entirely via directives.
+	if len(oldLines) == 0 || len(newLines) == 0 {
+		return
+	}
+	if p.OldNoFinalNL == p.NewNoFinalNL {
+		return
+	}
+	last := len(oldLines) - 1
+	lead := context
+	if lead > last {
+		lead = last
+	}
+	if lead < 0 {
+		lead = 0
+	}
+	h := &Hunk{
+		OldStart: last - lead + 1,
+		OldLines: lead + 1,
+		NewStart: last - lead + 1,
+		NewLines: lead + 1,
+	}
+	for i := last - lead; i < last; i++ {
+		h.Lines = append(h.Lines, Line{Op: OpContext, Text: oldLines[i]})
+	}
+	h.Lines = append(h.Lines,
+		Line{Op: OpDelete, Text: oldLines[last], NoNewline: p.OldNoFinalNL},
+		Line{Op: OpAdd, Text: newLines[last], NoNewline: p.NewNoFinalNL},
+	)
+	p.Hunks = append(p.Hunks, h)
 }
 
 // buildPatch groups the edit script into hunks with context.
@@ -106,14 +227,14 @@ func buildPatch(oldLines, newLines []string, ops []Op, context int) *Patch {
 			e := seq[i]
 			switch e.op {
 			case OpContext:
-				hunk.Lines = append(hunk.Lines, Line{OpContext, e.text})
+				hunk.Lines = append(hunk.Lines, Line{Op: OpContext, Text: e.text})
 				oldCount++
 				newCount++
 			case OpAdd:
-				hunk.Lines = append(hunk.Lines, Line{OpAdd, e.text})
+				hunk.Lines = append(hunk.Lines, Line{Op: OpAdd, Text: e.text})
 				newCount++
 			case OpDelete:
-				hunk.Lines = append(hunk.Lines, Line{OpDelete, e.text})
+				hunk.Lines = append(hunk.Lines, Line{Op: OpDelete, Text: e.text})
 				oldCount++
 			}
 		}

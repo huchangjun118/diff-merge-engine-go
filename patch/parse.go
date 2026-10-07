@@ -4,26 +4,31 @@ package patch
 import (
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/huchangjun118/diff-merge-engine-go/derr"
 	"github.com/huchangjun118/diff-merge-engine-go/diff"
 )
 
 // Parse reads a unified diff and returns a portable Patch.
-// It accepts patches with or without timestamps/index lines and normalizes
-// line endings. Malformed hunks produce a KindMalformedPatch error.
+//
+// It accepts patches with or without timestamps/index lines. The patch text
+// itself may use LF or CRLF separators (its own separators are normalized),
+// but the line-ending style of the referenced content is taken exclusively
+// from the '# eol-old'/'# eol-new' directives (default LF).
+//
+// Malformed patch text, invalid UTF-8 and hunk counts that disagree with the
+// hunk header produce distinguishable errors and never return a partial
+// patch.
 func Parse(text string) (*diff.Patch, error) {
-	text = strings.ReplaceAll(text, "\r\n", "\n")
-	text = strings.ReplaceAll(text, "\r", "\n")
-	lines := strings.Split(text, "\n")
-	// Drop a single trailing empty element produced by a final newline.
-	if len(lines) > 0 && lines[len(lines)-1] == "" {
-		lines = lines[:len(lines)-1]
+	if !utf8.ValidString(text) {
+		return nil, derr.New(derr.KindEncodingMismatch, "patch text is not valid UTF-8")
 	}
+	lines := splitPatchLines(text)
 
 	p := &diff.Patch{}
 	i := 0
-	// Skip leading index/other lines until we find --- header.
+	// Skip leading index/other lines until we find the --- header.
 	for i < len(lines) {
 		if strings.HasPrefix(lines[i], "--- ") || lines[i] == "---" {
 			break
@@ -41,6 +46,38 @@ func Parse(text string) (*diff.Patch, error) {
 	p.NewFile = parseFileName(lines[i])
 	i++
 
+	// Parse directive lines (blank lines tolerated).
+	for i < len(lines) {
+		line := lines[i]
+		if line == "" {
+			i++
+			continue
+		}
+		if strings.HasPrefix(line, diff.DirectiveEOLOld) {
+			eol, err := parseEOLValue(strings.TrimSpace(strings.TrimPrefix(line, diff.DirectiveEOLOld)))
+			if err != nil {
+				return nil, err
+			}
+			p.OldEOL = eol
+			i++
+			continue
+		}
+		if strings.HasPrefix(line, diff.DirectiveEOLNew) {
+			eol, err := parseEOLValue(strings.TrimSpace(strings.TrimPrefix(line, diff.DirectiveEOLNew)))
+			if err != nil {
+				return nil, err
+			}
+			p.NewEOL = eol
+			i++
+			continue
+		}
+		if strings.HasPrefix(line, "#") {
+			return nil, derr.New(derr.KindMalformedPatch, "unknown directive: "+line)
+		}
+		break
+	}
+
+	sawHunk := false
 	for i < len(lines) {
 		line := lines[i]
 		if line == "" {
@@ -48,9 +85,10 @@ func Parse(text string) (*diff.Patch, error) {
 			continue
 		}
 		if strings.HasPrefix(line, "--- ") || strings.HasPrefix(line, "+++ ") {
-			// Could be a second file in a multi-file patch; we only support one file.
-			i++
-			continue
+			return nil, derr.New(derr.KindMalformedPatch, "multi-file patches are not supported")
+		}
+		if strings.HasPrefix(line, "#") {
+			return nil, derr.New(derr.KindMalformedPatch, "directive outside the header section: "+line)
 		}
 		if !strings.HasPrefix(line, "@@") {
 			return nil, derr.New(derr.KindMalformedPatch, "expected hunk header, got: "+line)
@@ -60,8 +98,52 @@ func Parse(text string) (*diff.Patch, error) {
 			return nil, err
 		}
 		p.Hunks = append(p.Hunks, h)
+		sawHunk = true
+	}
+
+	// Derive trailing-newline metadata from the markers of the final hunk.
+	if sawHunk {
+		last := p.Hunks[len(p.Hunks)-1]
+		if last.OldStart >= 0 && last.OldStart-1+last.OldLines >= 0 {
+			for k := len(last.Lines) - 1; k >= 0; k-- {
+				if last.Lines[k].Op == diff.OpContext || last.Lines[k].Op == diff.OpDelete {
+					p.OldNoFinalNL = last.Lines[k].NoNewline
+					break
+				}
+			}
+		}
+		for k := len(last.Lines) - 1; k >= 0; k-- {
+			if last.Lines[k].Op == diff.OpContext || last.Lines[k].Op == diff.OpAdd {
+				p.NewNoFinalNL = last.Lines[k].NoNewline
+				break
+			}
+		}
 	}
 	return p, nil
+}
+
+// splitPatchLines splits the patch text, tolerating LF and CRLF patch
+// separators and dropping exactly one final empty element.
+func splitPatchLines(text string) []string {
+	lines := strings.Split(text, "\n")
+	for k := range lines {
+		lines[k] = strings.TrimSuffix(lines[k], "\r")
+	}
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
+}
+
+func parseEOLValue(v string) (diff.EOL, error) {
+	switch v {
+	case "lf":
+		return diff.EOLLF, nil
+	case "crlf":
+		return diff.EOLCRLF, nil
+	default:
+		return diff.EOLDefault, derr.New(derr.KindMalformedPatch, "unknown eol directive value: "+v)
+	}
 }
 
 func parseFileName(header string) string {
@@ -89,17 +171,28 @@ func parseHunk(lines []string, i *int) (*diff.Hunk, error) {
 	*i++
 	h := &diff.Hunk{OldStart: oldStart, OldLines: oldLines, NewStart: newStart, NewLines: newLines}
 	oldCount, newCount := 0, 0
+	noNL := false
 	for *i < len(lines) {
 		l := lines[*i]
+		if strings.HasPrefix(l, "@@") || strings.HasPrefix(l, "--- ") || strings.HasPrefix(l, "+++ ") {
+			break
+		}
+		if l == "\\ No newline at end of file" {
+			if len(h.Lines) == 0 {
+				return nil, derr.New(derr.KindMalformedPatch, "no-newline marker without a preceding hunk line")
+			}
+			if noNL {
+				return nil, derr.New(derr.KindMalformedPatch, "duplicate no-newline marker")
+			}
+			h.Lines[len(h.Lines)-1].NoNewline = true
+			noNL = true
+			*i++
+			continue
+		}
+		noNL = false
 		if l == "" {
 			// A blank line inside a hunk is a context line with empty text.
 			l = " "
-		}
-		if strings.HasPrefix(l, "@@") {
-			break
-		}
-		if strings.HasPrefix(l, "--- ") || strings.HasPrefix(l, "+++ ") {
-			break
 		}
 		switch l[0] {
 		case ' ':
@@ -112,23 +205,15 @@ func parseHunk(lines []string, i *int) (*diff.Hunk, error) {
 		case '-':
 			h.Lines = append(h.Lines, diff.Line{Op: diff.OpDelete, Text: l[1:]})
 			oldCount++
-		case '\\':
-			// "\ No newline at end of file" marker; skip.
 		default:
 			return nil, derr.New(derr.KindMalformedPatch, "invalid hunk line: "+l)
 		}
 		*i++
 	}
-	// Validate counts match the header (header counts may be omitted/1).
 	if oldCount != oldLines || newCount != newLines {
-		// Some patches omit counts; recompute tolerance: only fail if header
-		// declared a count that disagrees.
-		if oldLines != 0 && oldCount != oldLines {
-			return nil, derr.New(derr.KindMalformedPatch, "old line count mismatch in hunk")
-		}
-		if newLines != 0 && newCount != newLines {
-			return nil, derr.New(derr.KindMalformedPatch, "new line count mismatch in hunk")
-		}
+		return nil, derr.New(derr.KindMalformedPatch,
+			"hunk line count mismatch: header says old="+itoa(oldLines)+",new="+itoa(newLines)+
+				" but body has old="+itoa(oldCount)+",new="+itoa(newCount))
 	}
 	return h, nil
 }
@@ -158,24 +243,38 @@ func parseHunkHeader(header string) (oldStart, oldLines, newStart, newLines int,
 }
 
 func parseRange(spec string) (start, count int, err error) {
-	spec = strings.TrimPrefix(spec, "-")
-	spec = strings.TrimPrefix(spec, "+")
+	if spec == "" {
+		return 0, 0, derr.New(derr.KindMalformedPatch, "empty range in hunk header")
+	}
+	neg := false
+	switch spec[0] {
+	case '-', '+':
+		spec = spec[1:]
+	}
+	if strings.HasPrefix(spec, "-") {
+		neg = true
+		spec = strings.TrimPrefix(spec, "-")
+	}
 	if idx := strings.IndexByte(spec, ','); idx >= 0 {
 		start, err = atoi(spec[:idx])
 		if err != nil {
-			return 0, 0, err
+			return 0, 0, derr.Wrap(derr.KindMalformedPatch, "bad range start", err)
 		}
 		count, err = atoi(spec[idx+1:])
 		if err != nil {
-			return 0, 0, err
+			return 0, 0, derr.Wrap(derr.KindMalformedPatch, "bad range count", err)
 		}
-		return start, count, nil
+	} else {
+		start, err = atoi(spec)
+		if err != nil {
+			return 0, 0, derr.Wrap(derr.KindMalformedPatch, "bad range start", err)
+		}
+		count = 1
 	}
-	start, err = atoi(spec)
-	if err != nil {
-		return 0, 0, err
+	if neg || start < 0 || count < 0 {
+		return 0, 0, derr.New(derr.KindMalformedPatch, "negative range in hunk header")
 	}
-	return start, 1, nil
+	return start, count, nil
 }
 
 func atoi(s string) (int, error) {

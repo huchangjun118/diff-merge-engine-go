@@ -118,15 +118,35 @@ func itoa(n int) string {
 	return string(b[i:])
 }
 
-func TestLineEndingIndependence(t *testing.T) {
-	// Same content with different line endings should produce the same patch.
+func TestLineEndingExpressed(t *testing.T) {
+	// Patches now explicitly carry the line-ending style. The text hunks are
+	// identical; only the eol directives differ.
 	lf := "a\nb\nc\n"
 	crlf := "a\r\nb\r\nc\r\n"
 	p1 := Generate(lf, "a\nB\nc\n", 1)
-	p2 := Generate(crlf, "a\nB\nc\n", 1)
-	if p1.Format() != p2.Format() {
-		t.Error("patches differ based on line endings")
+	p2 := Generate(crlf, "a\r\nB\r\nc\r\n", 1)
+	if p1.NewEOL != EOLLF || p2.NewEOL != EOLCRLF {
+		t.Errorf("EOL = %v,%v; want LF,CRLF", p1.NewEOL, p2.NewEOL)
 	}
+	if !strings.Contains(p2.Format(), "# eol-new: crlf") {
+		t.Errorf("CRLF patch missing eol directive:\n%s", p2.Format())
+	}
+	// The hunk bodies (ignoring directives) match.
+	body1 := stripDirectives(p1.Format())
+	body2 := stripDirectives(p2.Format())
+	if body1 != body2 {
+		t.Errorf("hunk bodies differ:\n%q\n%q", body1, body2)
+	}
+}
+
+func stripDirectives(s string) string {
+	var out []string
+	for _, l := range strings.Split(s, "\n") {
+		if !strings.HasPrefix(l, "# ") {
+			out = append(out, l)
+		}
+	}
+	return strings.Join(out, "\n")
 }
 
 func TestNoTrailingNewline(t *testing.T) {

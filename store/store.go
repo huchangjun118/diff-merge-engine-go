@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 
@@ -24,7 +23,9 @@ type Store struct {
 	mu   sync.Mutex // serializes in-process operations
 }
 
-// Open opens (or creates) a store at root.
+// Open opens (or creates) a store at root. Any interrupted transaction from a
+// previous process is rolled back to a consistent committed version before
+// the store becomes usable.
 func Open(root string) (*Store, error) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, derr.Wrap(derr.KindCorrupt, "cannot create store root", err)
@@ -33,14 +34,14 @@ func Open(root string) (*Store, error) {
 	if err := s.ensureLayout(); err != nil {
 		return nil, err
 	}
-	if err := s.Recover(); err != nil {
+	if err := s.recoverLocked(); err != nil {
 		return nil, err
 	}
 	return s, nil
 }
 
 func (s *Store) ensureLayout() error {
-	for _, d := range []string{"blobs", "commits", "locks", "tmp"} {
+	for _, d := range []string{dirBlobs, dirCommits, dirChanges, dirLocks, dirTmp} {
 		if err := os.MkdirAll(filepath.Join(s.root, d), 0o755); err != nil {
 			return derr.Wrap(derr.KindCorrupt, "cannot create store layout", err)
 		}
@@ -92,6 +93,9 @@ func (s *Store) Get(hash string) (string, error) {
 // ApplyPatch applies a patch to the content identified by baseHash and stores
 // the result. It is idempotent: applying the same patch to the same base
 // returns the previously computed result without re-applying.
+//
+// Note: this is a direct one-shot application and is intentionally separate
+// from Submit, which stacks collaborator changes onto the latest tip.
 func (s *Store) ApplyPatch(baseHash string, p *diff.Patch, opts patch.ApplyOptions) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -99,9 +103,10 @@ func (s *Store) ApplyPatch(baseHash string, p *diff.Patch, opts patch.ApplyOptio
 	patchHash := Hash(p.Format())
 	idemKey := baseHash + ":" + patchHash
 
-	// Check idempotency.
 	if resultHash, ok := s.lookupIdem(idemKey); ok {
-		return resultHash, nil
+		if s.Has(resultHash) {
+			return resultHash, nil
+		}
 	}
 
 	base, err := s.Get(baseHash)
@@ -116,54 +121,75 @@ func (s *Store) ApplyPatch(baseHash string, p *diff.Patch, opts patch.ApplyOptio
 	if err != nil {
 		return "", err
 	}
-	// Record the commit and idempotency mapping atomically.
 	if err := s.commit(baseHash, resultHash, patchHash, idemKey); err != nil {
 		return "", err
 	}
 	return resultHash, nil
 }
 
-// commit records a version commit and idempotency mapping.
+// commit records a one-shot application result and its idempotency mapping.
 func (s *Store) commit(baseHash, resultHash, patchHash, idemKey string) error {
 	commit := fmt.Sprintf("base=%s\nresult=%s\npatch=%s\n", baseHash, resultHash, patchHash)
-	if err := s.atomicWrite(s.commitPath(resultHash), commit); err != nil {
+	if err := s.atomicWrite(filepath.Join(s.root, dirCommits, "apply-"+resultHash), commit); err != nil {
 		return err
 	}
-	if err := s.atomicWrite(s.idemPath(idemKey), resultHash); err != nil {
+	if err := s.atomicWrite(filepath.Join(s.root, dirCommits, "idem-"+Hash(idemKey)), resultHash); err != nil {
 		return err
 	}
 	return nil
 }
 
-// History returns the list of commit hashes in chronological order.
+// History returns the content hashes on the linear committed chain, oldest
+// first, by walking HEAD backwards through parent pointers.
 func (s *Store) History() ([]string, error) {
-	entries, err := os.ReadDir(filepath.Join(s.root, "commits"))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, err := s.branch()
 	if err != nil {
-		return nil, derr.Wrap(derr.KindCorrupt, "cannot read commits", err)
+		return nil, err
 	}
-	var hashes []string
-	for _, e := range entries {
-		if !e.IsDir() && !strings.HasPrefix(e.Name(), "idem-") {
-			hashes = append(hashes, e.Name())
+	defer b.Close()
+	st, err := b.readHEAD()
+	if derr.IsKind(err, derr.KindCorrupt) {
+		if rerr := b.recoverHEAD(); rerr != nil {
+			return nil, rerr
 		}
+		st, err = b.readHEAD()
+		if err != nil {
+			return nil, err
+		}
+	} else if err != nil {
+		return nil, err
 	}
-	sort.Strings(hashes)
-	return hashes, nil
+	var chain []string
+	cur := st.head
+	seen := map[string]bool{}
+	for cur != "" && !seen[cur] {
+		seen[cur] = true
+		chain = append(chain, cur)
+		data, err := os.ReadFile(filepath.Join(s.root, dirCommits, cur))
+		if err != nil {
+			break
+		}
+		rec, err := parseCommit(string(data), cur)
+		if err != nil {
+			break
+		}
+		cur = rec.parent
+	}
+	// Reverse to oldest-first.
+	for i, j := 0, len(chain)-1; i < j; i, j = i+1, j-1 {
+		chain[i], chain[j] = chain[j], chain[i]
+	}
+	return chain, nil
 }
 
-// Recover rolls back incomplete operations after a crash. It removes
-// orphaned temp files and incomplete commits.
+// Recover rolls back incomplete operations after a crash: it removes orphaned
+// temp files and rebuilds HEAD so it points at a fully committed version.
 func (s *Store) Recover() error {
-	// Clean tmp directory.
-	tmpDir := filepath.Join(s.root, "tmp")
-	entries, err := os.ReadDir(tmpDir)
-	if err != nil {
-		return derr.Wrap(derr.KindCorrupt, "cannot read tmp", err)
-	}
-	for _, e := range entries {
-		os.Remove(filepath.Join(tmpDir, e.Name()))
-	}
-	return nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.recoverLocked()
 }
 
 // atomicWrite writes content to a temp file, fsyncs and renames it into place.
@@ -193,19 +219,11 @@ func (s *Store) atomicWrite(path, content string) error {
 }
 
 func (s *Store) blobPath(hash string) string {
-	return filepath.Join(s.root, "blobs", hash)
-}
-
-func (s *Store) commitPath(hash string) string {
-	return filepath.Join(s.root, "commits", hash)
-}
-
-func (s *Store) idemPath(key string) string {
-	return filepath.Join(s.root, "commits", "idem-"+Hash(key))
+	return filepath.Join(s.root, dirBlobs, hash)
 }
 
 func (s *Store) lookupIdem(key string) (string, bool) {
-	data, err := os.ReadFile(s.idemPath(key))
+	data, err := os.ReadFile(filepath.Join(s.root, dirCommits, "idem-"+Hash(key)))
 	if err != nil {
 		return "", false
 	}

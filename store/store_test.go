@@ -130,16 +130,15 @@ func TestHistory(t *testing.T) {
 	base := "a\nb\nc\n"
 	baseHash, _ := s.Put(base)
 	p := diff.Generate(base, "a\nB\nc\n", 1)
-	_, err = s.ApplyPatch(baseHash, p, patch.ApplyOptions{})
-	if err != nil {
-		t.Fatalf("ApplyPatch failed: %v", err)
+	if _, err := s.Submit(baseHash, p, patch.ApplyOptions{}); err != nil {
+		t.Fatalf("Submit failed: %v", err)
 	}
 	history, err := s.History()
 	if err != nil {
 		t.Fatalf("History failed: %v", err)
 	}
-	if len(history) != 1 {
-		t.Errorf("History = %v; want 1 entry", history)
+	if len(history) != 2 {
+		t.Errorf("History = %v; want 2 entries (base + submitted)", history)
 	}
 }
 

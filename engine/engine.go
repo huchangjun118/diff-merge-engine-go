@@ -52,6 +52,19 @@ func (e *Engine) Merge(base, ours, theirs string) *merge.MergeResult {
 	return merge.Merge(base, ours, theirs)
 }
 
+// Submit stacks a collaborator patch (authored against baseHash) onto the
+// latest committed tip and advances the branch. See store.Store.Submit for
+// the ordering, duplication and crash-recovery guarantees.
+func (e *Engine) Submit(baseHash string, p *diff.Patch, opts patch.ApplyOptions) (store.SubmitResult, error) {
+	return e.store.Submit(baseHash, p, opts)
+}
+
+// Head returns the current committed tip hash.
+func (e *Engine) Head() (string, error) { return e.store.Head() }
+
+// Tip returns the current committed tip content.
+func (e *Engine) Tip() (string, error) { return e.store.Tip() }
+
 // Store returns the underlying content-addressed store.
 func (e *Engine) Store() *store.Store {
 	return e.store
