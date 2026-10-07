@@ -6,11 +6,17 @@ import (
 
 // Reverse returns a new patch that, when applied to the patched content,
 // restores the original content. Add and delete operations are swapped in
-// place (line order is preserved) and hunk coordinates are exchanged.
+// place (line order is preserved), hunk coordinates are exchanged and the
+// byte-level text conventions (EOL style and trailing-newline state) are
+// swapped as well.
 func Reverse(p *diff.Patch) *diff.Patch {
 	r := &diff.Patch{
-		OldFile: p.NewFile,
-		NewFile: p.OldFile,
+		OldFile:            p.NewFile,
+		NewFile:            p.OldFile,
+		OldEOL:             p.NewEOL,
+		NewEOL:             p.OldEOL,
+		OldTrailingNewline: p.NewTrailingNewline,
+		NewTrailingNewline: p.OldTrailingNewline,
 	}
 	for _, h := range p.Hunks {
 		rh := &diff.Hunk{

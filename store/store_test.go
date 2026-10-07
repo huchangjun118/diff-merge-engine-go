@@ -128,18 +128,23 @@ func TestHistory(t *testing.T) {
 		t.Fatalf("Open failed: %v", err)
 	}
 	base := "a\nb\nc\n"
-	baseHash, _ := s.Put(base)
-	p := diff.Generate(base, "a\nB\nc\n", 1)
-	_, err = s.ApplyPatch(baseHash, p, patch.ApplyOptions{})
+	baseHash, err := s.InitBase(base)
 	if err != nil {
-		t.Fatalf("ApplyPatch failed: %v", err)
+		t.Fatalf("InitBase failed: %v", err)
+	}
+	p := diff.Generate(base, "a\nB\nc\n", 1)
+	if _, err = s.Submit(p, patch.ApplyOptions{}); err != nil {
+		t.Fatalf("Submit failed: %v", err)
 	}
 	history, err := s.History()
 	if err != nil {
 		t.Fatalf("History failed: %v", err)
 	}
-	if len(history) != 1 {
-		t.Errorf("History = %v; want 1 entry", history)
+	if len(history) != 2 {
+		t.Fatalf("History = %v; want base+1 entry (%d)", history, len(history))
+	}
+	if history[0] != baseHash {
+		t.Errorf("history[0] = %v; want base %v", history[0], baseHash)
 	}
 }
 

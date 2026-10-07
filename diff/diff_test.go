@@ -119,13 +119,52 @@ func itoa(n int) string {
 }
 
 func TestLineEndingIndependence(t *testing.T) {
-	// Same content with different line endings should produce the same patch.
+	// Two versions with LF endings must produce identical patches regardless
+	// of incidental CR normalization, and the EOL style must be carried
+	// explicitly rather than silently flattened.
 	lf := "a\nb\nc\n"
-	crlf := "a\r\nb\r\nc\r\n"
 	p1 := Generate(lf, "a\nB\nc\n", 1)
-	p2 := Generate(crlf, "a\nB\nc\n", 1)
+	p2 := Generate(lf, "a\nB\nc\n", 1)
 	if p1.Format() != p2.Format() {
-		t.Error("patches differ based on line endings")
+		t.Error("identical LF inputs produced different patches")
+	}
+
+	crlf := "a\r\nb\r\nc\r\n"
+	pc := Generate(crlf, "a\r\nB\r\nc\r\n", 1)
+	if pc.OldEOL != EOLCRLF || pc.NewEOL != EOLCRLF {
+		t.Errorf("CRLF patch lost EOL metadata: old=%v new=%v", pc.OldEOL, pc.NewEOL)
+	}
+	if !strings.Contains(pc.Format(), "eol: old=crlf new=crlf") {
+		t.Errorf("CRLF patch missing EOL directive:\n%s", pc.Format())
+	}
+}
+
+func TestTrailingNewlineOnlyChange(t *testing.T) {
+	// Adding/removing only the final newline must produce an expressible hunk.
+	p := Generate("a\nb\nc\n", "a\nb\nc", 1)
+	if len(p.Hunks) == 0 {
+		t.Fatal("trailing-newline-only change produced an empty diff")
+	}
+	if p.OldTrailingNewline != true || p.NewTrailingNewline != false {
+		t.Errorf("trailing flags = %v/%v; want true/false", p.OldTrailingNewline, p.NewTrailingNewline)
+	}
+	if !strings.Contains(p.Format(), `\ No newline at end of file`) {
+		t.Errorf("patch missing no-newline marker:\n%s", p.Format())
+	}
+
+	p2 := Generate("a\nb\nc", "a\nb\nc\n", 1)
+	if len(p2.Hunks) == 0 {
+		t.Fatal("adding trailing newline produced an empty diff")
+	}
+}
+
+func TestEOLOnyChangeIsMetadata(t *testing.T) {
+	p := Generate("a\nb\nc\n", "a\r\nb\r\nc\r\n", 1)
+	if len(p.Hunks) != 0 {
+		t.Errorf("EOL-only change should have no hunks, got %d", len(p.Hunks))
+	}
+	if p.OldEOL != EOLLF || p.NewEOL != EOLCRLF {
+		t.Errorf("EOL metadata wrong: old=%v new=%v", p.OldEOL, p.NewEOL)
 	}
 }
 

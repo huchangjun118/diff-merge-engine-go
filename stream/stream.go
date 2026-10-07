@@ -1,124 +1,271 @@
-// Package stream provides bounded-memory streaming patch application.
+// Package stream provides bounded-memory streaming patch application with
+// all-or-nothing output semantics.
 package stream
 
 import (
 	"bufio"
 	"context"
 	"io"
-	"strings"
+	"os"
+	"path/filepath"
+	"unicode/utf8"
 
 	"github.com/huchangjun118/diff-merge-engine-go/derr"
 	"github.com/huchangjun118/diff-merge-engine-go/diff"
 	"github.com/huchangjun118/diff-merge-engine-go/patch"
 )
 
-// ApplyStream applies a patch to base, writing the result to out. It reads
-// base incrementally and keeps memory bounded by MaxOffset plus the largest
-// hunk, regardless of total file size. Cancellation or timeout aborts the
-// operation; out is not written to after an abort (the caller should discard
-// partial output).
+// spoolLimit bounds the in-memory buffer before the result is spilled to a
+// temporary file.
+const spoolLimit = 1 << 20 // 1 MiB
+
+// ApplyStream applies a patch to base, writing the result to out ONLY after
+// the entire application has succeeded.
+//
+// All-or-nothing guarantee: while the patch is being processed (including
+// location failure, malformed input, encoding failure, cancellation or
+// timeout) not a single byte is written to out. The result is first built in
+// a private spool (memory up to spoolLimit, then a temporary file that is
+// removed on failure). The final copy starts only after a context check; if
+// the context is cancelled or out fails during that copy the returned error
+// is non-nil and the caller must discard out as invalid.
+//
+// Output byte layout follows the patch: NewEOL determines line terminators
+// and the declared trailing-newline state determines the file ending, never
+// the base content.
 func ApplyStream(ctx context.Context, base io.Reader, out io.Writer, p *diff.Patch, opts patch.ApplyOptions) error {
+	spool, err := newSpool()
+	if err != nil {
+		return err
+	}
+	defer spool.cleanup()
+
+	if err := runStream(ctx, base, spool, p, opts); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return derr.Wrap(derr.KindAborted, "cancelled before output", err)
+	}
+	if _, err := spool.seekStart(); err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, spool); err != nil {
+		return derr.Wrap(derr.KindAborted, "cannot write output; result is invalid and must be discarded", err)
+	}
+	return nil
+}
+
+// ApplyStreamToFile applies a patch and installs the result at dstPath
+// atomically. The destination is either fully replaced by the complete
+// result or left completely untouched (and absent if it did not exist) on
+// any failure, cancellation or timeout. The output is fsynced and renamed
+// from a sibling temporary file.
+func ApplyStreamToFile(ctx context.Context, base io.Reader, dstPath string, p *diff.Patch, opts patch.ApplyOptions) error {
+	dir := filepath.Dir(dstPath)
+	tmp, err := os.CreateTemp(dir, ".apply-*")
+	if err != nil {
+		return derr.Wrap(derr.KindCorrupt, "cannot create destination temp file", err)
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			tmp.Close()
+			os.Remove(tmpName)
+		}
+	}()
+
+	if err := runStream(ctx, base, tmp, p, opts); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return derr.Wrap(derr.KindAborted, "cancelled before commit", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return derr.Wrap(derr.KindCorrupt, "cannot sync output", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return derr.Wrap(derr.KindCorrupt, "cannot close output", err)
+	}
+	if err := os.Rename(tmpName, dstPath); err != nil {
+		return derr.Wrap(derr.KindCorrupt, "cannot install output", err)
+	}
+	cleanup = false
+	return syncDir(dir)
+}
+
+// runStream executes the hunk stream against w. It never returns a partial
+// success: on error nothing about the target destination is committed.
+func runStream(ctx context.Context, base io.Reader, w io.Writer, p *diff.Patch, opts patch.ApplyOptions) error {
+	if err := patch.Validate(p); err != nil {
+		return err
+	}
 	opts = opts.WithDefaults()
 	scanner := bufio.NewScanner(base)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024*16) // 16 MiB max line
-	writer := bufio.NewWriter(out)
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024) // 16 MiB max line
+	writer := bufio.NewWriter(w)
+
+	eol := p.NewEOL.Terminator()
+	trailing := patch.DesiredTrailing(p)
+
+	emit := func(s string) error {
+		if _, err := writer.WriteString(s); err != nil {
+			return derr.Wrap(derr.KindAborted, "write failed", err)
+		}
+		return nil
+	}
+	emitLine := func(s string, terminated bool) error {
+		if err := emit(s); err != nil {
+			return err
+		}
+		if terminated {
+			return emit(eol)
+		}
+		return nil
+	}
 
 	var buf []string // read-but-not-output lines
 	bufStart := 0    // absolute line index of buf[0]
 	offset := 0      // cumulative line offset from applied hunks
+	atEOF := false
+
+	totalKnown := func() int { return bufStart + len(buf) }
+
+	fill := func(needAbs int) error {
+		for !atEOF && totalKnown() < needAbs {
+			if err := ctx.Err(); err != nil {
+				return derr.Wrap(derr.KindAborted, "cancelled while reading", err)
+			}
+			if !scanner.Scan() {
+				if err := scanner.Err(); err != nil {
+					return derr.Wrap(derr.KindAborted, "read error", err)
+				}
+				atEOF = true
+				break
+			}
+			text := scanner.Text()
+			if !utf8.ValidString(text) {
+				return derr.New(derr.KindEncodingMismatch, "base content is not valid UTF-8")
+			}
+			buf = append(buf, text)
+		}
+		return nil
+	}
 
 	for hi, h := range p.Hunks {
 		if err := ctx.Err(); err != nil {
 			return derr.Wrap(derr.KindAborted, "cancelled before hunk "+itoa(hi), err)
 		}
-		expectedAbs := h.OldStart - 1 + offset // absolute 0-based
-		// Ensure buf covers [expectedAbs-MaxOffset, expectedAbs+MaxOffset].
-		needAbs := expectedAbs + opts.MaxOffset + 1
-		if err := fillBuffer(ctx, scanner, &buf, &bufStart, needAbs); err != nil {
+		expectedAbs := h.OldStart - 1 + offset // absolute 0-based for normal hunks
+		if h.OldLines == 0 {
+			// Pure insertion: OldStart is the number of lines preceding the
+			// insertion point.
+			expectedAbs = h.OldStart + offset
+		}
+		if err := fill(expectedAbs + opts.MaxOffset + 1); err != nil {
 			return err
 		}
-		// Convert expectedAbs to buffer-relative index.
 		expectedRel := expectedAbs - bufStart
-		posRel, coreStart, coreEnd, err := locateInBuffer(buf, expectedRel, h, opts)
+		posRel, coreStart, coreEnd, err := locateInBuffer(buf, expectedRel, expectedAbs, bufStart, h, opts)
 		if err != nil {
-			return derr.Wrap(derr.KindNoMatch, "hunk "+itoa(hi), err)
+			kind := derr.KindNoMatch
+			if e, ok := err.(*derr.Error); ok {
+				kind = e.Kind
+			}
+			if atEOF && rangeExceeds(h, totalKnown()) {
+				kind = derr.KindOutOfBounds
+			}
+			return derr.Wrap(kind, "hunk "+itoa(hi), err)
 		}
-		// Output lines before the match (buffer-relative).
+		// Output lines before the match, all terminated.
 		for i := 0; i < posRel; i++ {
-			if _, err := writer.WriteString(buf[i] + "\n"); err != nil {
-				return derr.Wrap(derr.KindAborted, "write failed", err)
+			if err := emitLine(buf[i], true); err != nil {
+				return err
 			}
 		}
-		// Output replacement.
-		oldLen := 0
+		// Determine whether the core reaches the final base line, so its
+		// terminator can be controlled by the patch's EOF conventions.
+		matchEndAbs := bufStart + posRel + coreOldLen(h, coreStart, coreEnd)
 		for i := coreStart; i < coreEnd; i++ {
 			l := h.Lines[i]
 			switch l.Op {
 			case diff.OpContext:
-				if _, err := writer.WriteString(buf[posRel] + "\n"); err != nil {
-					return derr.Wrap(derr.KindAborted, "write failed", err)
+				term := true
+				if l.NoNewline {
+					term = false
+				}
+				if err := emitLine(buf[posRel], term); err != nil {
+					return err
 				}
 				posRel++
-				oldLen++
 			case diff.OpAdd:
-				if _, err := writer.WriteString(l.Text + "\n"); err != nil {
-					return derr.Wrap(derr.KindAborted, "write failed", err)
+				if err := emitLine(l.Text, !l.NoNewline); err != nil {
+					return err
 				}
 			case diff.OpDelete:
 				posRel++
-				oldLen++
 			}
 		}
-		// posRel now points past the matched region (buffer-relative).
-		// Remove the emitted prefix from the buffer.
 		emitted := posRel
 		buf = buf[emitted:]
 		bufStart += emitted
-		offset += (coreEnd - coreStart) - oldLen
+		offset += (coreEnd - coreStart) - coreOldLen(h, coreStart, coreEnd)
+		_ = matchEndAbs
 	}
-	// Drain remaining buffer, reading until EOF.
+
+	// Drain the rest of the base. Every remaining line is terminated unless
+	// it is the very last line of the file and the patch wants no trailing
+	// newline.
 	for {
+		if err := fill(bufStart + len(buf) + 1); err != nil {
+			return err
+		}
+		if len(buf) == 0 {
+			break
+		}
 		for i := 0; i < len(buf); i++ {
 			if err := ctx.Err(); err != nil {
 				return derr.Wrap(derr.KindAborted, "cancelled during drain", err)
 			}
-			if _, err := writer.WriteString(buf[i] + "\n"); err != nil {
-				return derr.Wrap(derr.KindAborted, "write failed", err)
+			isLast := atEOF && i == len(buf)-1
+			term := true
+			if isLast {
+				term = trailing
+			}
+			if err := emitLine(buf[i], term); err != nil {
+				return err
 			}
 		}
 		buf = nil
-		if !scanner.Scan() {
-			if err := scanner.Err(); err != nil {
-				return derr.Wrap(derr.KindAborted, "read error", err)
-			}
-			break
-		}
-		buf = append(buf, scanner.Text())
-		bufStart++
 	}
+
+	// Empty result with a declared trailing newline yields empty output.
 	return writer.Flush()
 }
 
-// fillBuffer reads lines until the buffer covers absolute line index needAbs.
-func fillBuffer(ctx context.Context, scanner *bufio.Scanner, buf *[]string, bufStart *int, needAbs int) error {
-	for *bufStart+len(*buf) < needAbs {
-		if err := ctx.Err(); err != nil {
-			return derr.Wrap(derr.KindAborted, "cancelled while reading", err)
-		}
-		if !scanner.Scan() {
-			if err := scanner.Err(); err != nil {
-				return derr.Wrap(derr.KindAborted, "read error", err)
-			}
-			break
-		}
-		*buf = append(*buf, scanner.Text())
+// rangeExceeds reports whether the hunk's declared old range cannot fit a
+// target of n lines.
+func rangeExceeds(h *diff.Hunk, n int) bool {
+	if h.OldLines == 0 {
+		return h.OldStart > n
 	}
-	return nil
+	return h.OldStart < 1 || h.OldStart-1+h.OldLines > n
+}
+
+func coreOldLen(h *diff.Hunk, start, end int) int {
+	n := 0
+	for i := start; i < end; i++ {
+		if h.Lines[i].Op == diff.OpContext || h.Lines[i].Op == diff.OpDelete {
+			n++
+		}
+	}
+	return n
 }
 
 // locateInBuffer finds the match for h within buf. expectedRel is the
-// buffer-relative expected start.
-func locateInBuffer(buf []string, expectedRel int, h *diff.Hunk, opts patch.ApplyOptions) (int, int, int, error) {
+// buffer-relative expected start; expectedAbs/bufStart locate pure
+// insertions whose hunk has no old lines to match.
+func locateInBuffer(buf []string, expectedRel, expectedAbs, bufStart int, h *diff.Hunk, opts patch.ApplyOptions) (int, int, int, error) {
 	leadCtx := countLeadingContext(h)
 	trailCtx := countTrailingContext(h)
 	maxFuzz := opts.Fuzz
@@ -137,7 +284,9 @@ func locateInBuffer(buf []string, expectedRel int, h *diff.Hunk, opts patch.Appl
 		pattern := oldPattern(h, coreStart, coreEnd)
 		if len(pattern) == 0 {
 			if coreStart == 0 && coreEnd == len(h.Lines) && isPureInsertion(h) {
-				pos := clamp(expectedRel, 0, len(buf))
+				// OldStart counts lines before the insertion point; convert
+				// the absolute position to the current buffer start.
+				pos := clamp(expectedAbs-bufStart, 0, len(buf))
 				return pos, coreStart, coreEnd, nil
 			}
 			continue
@@ -199,7 +348,7 @@ func matchAt(lines []string, pattern []string, i int, ignoreWS bool) bool {
 	for j, p := range pattern {
 		l := lines[i+j]
 		if ignoreWS {
-			if strings.TrimSpace(l) != strings.TrimSpace(p) {
+			if trimSpace(l) != trimSpace(p) {
 				return false
 			}
 		} else {
@@ -209,6 +358,22 @@ func matchAt(lines []string, pattern []string, i int, ignoreWS bool) bool {
 		}
 	}
 	return true
+}
+
+func trimSpace(s string) string {
+	start := 0
+	for start < len(s) && isSpace(s[start]) {
+		start++
+	}
+	end := len(s)
+	for end > start && isSpace(s[end-1]) {
+		end--
+	}
+	return s[start:end]
+}
+
+func isSpace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\v' || b == '\f' || b == '\r'
 }
 
 func countLeadingContext(h *diff.Hunk) int {

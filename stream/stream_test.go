@@ -82,7 +82,6 @@ func TestApplyStreamNoTempFiles(t *testing.T) {
 	}
 }
 
-
 func TestApplyStreamWithFuzz(t *testing.T) {
 	// Test streaming with fuzz tolerance.
 	old := "a\nb\nc\nd\ne\n"
@@ -114,7 +113,7 @@ func TestApplyStreamAmbiguous(t *testing.T) {
 }
 
 func TestApplyStreamNoTrailingNewline(t *testing.T) {
-	// Stream should handle content without trailing newline.
+	// Stream output must honor the patch's end-of-file newline state.
 	base := "a\nb\nc"
 	p := diff.Generate(base, "a\nB\nc", 1)
 	var out strings.Builder
@@ -122,9 +121,8 @@ func TestApplyStreamNoTrailingNewline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ApplyStream failed: %v", err)
 	}
-	// The stream applier always adds newlines; this is acceptable for streaming.
-	if out.String() == "" {
-		t.Error("expected non-empty output")
+	if out.String() != "a\nB\nc" {
+		t.Errorf("Result = %q; want no trailing newline", out.String())
 	}
 }
 

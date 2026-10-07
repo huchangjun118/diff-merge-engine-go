@@ -1,7 +1,10 @@
 // Package derr defines distinguishable error kinds for the diff/merge engine.
 package derr
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
 // Kind classifies an error so callers can distinguish merge conflicts from
 // malformed input, encoding problems and out-of-bounds failures.
@@ -55,11 +58,11 @@ func Wrap(k Kind, msg string, cause error) *Error {
 	return &Error{Kind: k, Message: msg, Cause: cause}
 }
 
-// IsKind reports whether err is an *Error of the given Kind.
+// IsKind reports whether err is, or wraps, an *Error of the given Kind.
 func IsKind(err error, k Kind) bool {
-	e, ok := err.(*Error)
-	if !ok {
-		return false
+	var e *Error
+	if errors.As(err, &e) {
+		return e.Kind == k
 	}
-	return e.Kind == k
+	return false
 }

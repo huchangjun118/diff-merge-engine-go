@@ -125,3 +125,44 @@ func indexOf(s, sub string) int {
 	}
 	return -1
 }
+
+func TestMergeCRLFPreserved(t *testing.T) {
+	// Both sides keep CRLF; merged output must be CRLF byte-exact.
+	base := "a\r\nb\r\nc\r\n"
+	ours := "a\r\nB\r\nc\r\n"
+	theirs := "a\r\nb\r\nC\r\n"
+	r := Merge(base, ours, theirs)
+	if !r.Clean {
+		t.Fatalf("expected clean merge, conflicts=%v", r.Conflicts)
+	}
+	want := "a\r\nB\r\nC\r\n"
+	if r.String() != want {
+		t.Errorf("merge = %q; want %q", r.String(), want)
+	}
+}
+
+func TestMergeTrailingNewlinePreserved(t *testing.T) {
+	base := "a\nb\nc"
+	ours := "a\nB\nc"
+	theirs := "a\nb\nC"
+	r := Merge(base, ours, theirs)
+	got := r.String()
+	if got != "a\nB\nC" {
+		t.Errorf("merge without trailing newline = %q", got)
+	}
+}
+
+func TestMergeOneSideAddsTrailingNewline(t *testing.T) {
+	base := "a\nb\nc"
+	ours := "a\nB\nc"
+	theirs := "a\nb\nc\n"
+	r := Merge(base, ours, theirs)
+	got := r.String()
+	// Side changed different regions; theirs supplied the tail newline.
+	if !r.Clean {
+		t.Fatalf("expected clean, conflicts=%v", r.Conflicts)
+	}
+	if got != "a\nB\nc\n" {
+		t.Errorf("merge = %q; want newline adopted", got)
+	}
+}

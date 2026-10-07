@@ -2,6 +2,7 @@ package patch
 
 import (
 	"strings"
+	"unicode/utf8"
 
 	"github.com/huchangjun118/diff-merge-engine-go/derr"
 	"github.com/huchangjun118/diff-merge-engine-go/diff"
@@ -31,53 +32,120 @@ func (o *ApplyOptions) withDefaults() ApplyOptions {
 }
 
 // Apply applies patch to content and returns the resulting content.
-// On failure the original content is returned unchanged (no partial writes).
+//
+// The result is byte-level determined by the patch, never by the target's
+// own conventions:
+//
+//   - Output line endings equal the patch's NewEOL (LF when the patch does
+//     not declare one), regardless of the target's endings.
+//   - The output ends with a newline iff the patch's new side does. A patch
+//     without that metadata preserves the traditional trailing newline.
+//
+// Nothing is mutated on failure: on error the returned string is exactly the
+// input content and the error kind distinguishes malformed patches
+// (KindMalformedPatch), invalid input encoding (KindEncodingMismatch),
+// structurally out-of-range hunks (KindOutOfBounds), ambiguous
+// (KindAmbiguousMatch) and unlocatable (KindNoMatch) context.
 func Apply(content string, p *diff.Patch, opts ApplyOptions) (string, error) {
 	opts = opts.withDefaults()
+	if p == nil {
+		return content, derr.New(derr.KindMalformedPatch, "nil patch")
+	}
+	if !utf8.ValidString(content) {
+		return content, derr.New(derr.KindEncodingMismatch, "target content is not valid UTF-8")
+	}
 	lines := diff.SplitLines(content)
-	result := make([]string, len(lines))
-	copy(result, lines)
-	hadTrailingNewline := strings.HasSuffix(content, "\n")
+	work := make([]string, len(lines))
+	copy(work, lines)
+
+	if err := validateRanges(p, len(lines)); err != nil {
+		return content, err
+	}
 
 	offset := 0
 	for hi, h := range p.Hunks {
-		pos, coreStart, coreEnd, err := locateHunk(result, h, offset, opts)
+		pos, coreStart, coreEnd, err := locateHunk(work, h, offset, opts)
 		if err != nil {
 			return content, derr.Wrap(derr.Kind(errKind(err)), "hunk "+itoa(hi), err)
 		}
-		// Build replacement lines from the core hunk lines.
+		// Build replacement lines from the matched core.
 		var replacement []string
+		matchPos := pos
 		for i := coreStart; i < coreEnd; i++ {
 			l := h.Lines[i]
 			switch l.Op {
 			case diff.OpContext:
 				// Keep the target's matched text (preserves local whitespace).
-				replacement = append(replacement, result[pos])
-				pos++
+				replacement = append(replacement, work[matchPos])
+				matchPos++
 			case diff.OpAdd:
 				replacement = append(replacement, l.Text)
 			case diff.OpDelete:
-				// Removed: advance past the target line without emitting it.
-				pos++
+				matchPos++
 			}
 		}
-		// pos should now equal the end of the matched region.
 		oldLen := coreOldCount(h, coreStart, coreEnd)
-		// Splice.
-		newResult := make([]string, 0, len(result)-oldLen+len(replacement))
-		newResult = append(newResult, result[:pos-oldLen]...)
+		newResult := make([]string, 0, len(work)-oldLen+len(replacement))
+		newResult = append(newResult, work[:matchPos-oldLen]...)
 		newResult = append(newResult, replacement...)
-		newResult = append(newResult, result[pos:]...)
+		newResult = append(newResult, work[matchPos:]...)
 		offset += len(replacement) - oldLen
-		result = newResult
+		work = newResult
 	}
-	joined := diff.JoinLines(result)
-	// Preserve the input's trailing-newline property. An empty input has no
-	// prior line structure, so the output keeps its natural trailing newline.
-	if !hadTrailingNewline && len(lines) > 0 && joined != "" {
-		joined = strings.TrimSuffix(joined, "\n")
+
+	trailing := desiredTrailing(p, len(lines) > 0)
+	return diff.Render(work, p.NewEOL, trailing), nil
+}
+
+// desiredTrailing resolves the output trailing-newline state. Patches carrying
+// explicit metadata (the directive) or an EOF no-newline marker always win;
+// the target's own state is never consulted. Bare metadata-free patches keep
+// the traditional trailing newline.
+func desiredTrailing(p *diff.Patch, inputHadLines bool) bool {
+	if metadataPresent(p) {
+		return p.NewTrailingNewline
 	}
-	return joined, nil
+	if len(p.Hunks) > 0 {
+		last := p.Hunks[len(p.Hunks)-1]
+		for i := len(last.Lines) - 1; i >= 0; i-- {
+			l := last.Lines[i]
+			if l.Op == diff.OpAdd || l.Op == diff.OpContext {
+				return !l.NoNewline
+			}
+		}
+	}
+	return true
+}
+
+func metadataPresent(p *diff.Patch) bool {
+	return p.OldEOL != diff.EOLLF || p.NewEOL != diff.EOLLF ||
+		!p.OldTrailingNewline || !p.NewTrailingNewline
+}
+
+// validateRanges rejects hunks whose declared old range cannot exist in the
+// target before any mutation happens. This separates "the patch references
+// lines the file does not have" (KindOutOfBounds) from a contextual mismatch
+// at an existing location (KindNoMatch). Pure insertions (count 0) are valid
+// exactly at EOF.
+func validateRanges(p *diff.Patch, nLines int) error {
+	for hi, h := range p.Hunks {
+		start := h.OldStart // 1-based; 0 is used for leading insertions
+		count := h.OldLines
+		if count == 0 {
+			// Insertion point: start may equal nLines (append at EOF).
+			if start < 0 || start > nLines {
+				return derr.New(derr.KindOutOfBounds,
+					"hunk "+itoa(hi)+" insertion point "+itoa(start)+" exceeds content length "+itoa(nLines))
+			}
+			continue
+		}
+		if start < 1 || start-1+count > nLines {
+			return derr.New(derr.KindOutOfBounds,
+				"hunk "+itoa(hi)+" old range "+itoa(start)+","+itoa(count)+
+					" exceeds content length "+itoa(nLines))
+		}
+	}
+	return nil
 }
 
 // locateHunk finds the target index where h applies. It returns the start
@@ -89,7 +157,6 @@ func locateHunk(lines []string, h *diff.Hunk, offset int, opts ApplyOptions) (st
 		expected = 0
 	}
 	maxFuzz := opts.Fuzz
-	// Limit fuzz to available context lines.
 	leadCtx := countLeadingContext(h)
 	trailCtx := countTrailingContext(h)
 	if maxFuzz > leadCtx {
@@ -107,14 +174,13 @@ func locateHunk(lines []string, h *diff.Hunk, offset int, opts ApplyOptions) (st
 		}
 		pattern := oldPattern(h, coreStart, coreEnd)
 		if len(pattern) == 0 {
-			// Empty pattern (pure insertion or fuzz removed all context).
-			// Only treat as a match if the hunk is a genuine pure insertion
-			// (no context/delete lines in the original hunk).
 			if coreStart == 0 && coreEnd == len(h.Lines) && isPureInsertion(h) {
-				pos := clamp(expected, 0, len(lines))
+				// OldStart counts lines before the insertion point, so an
+				// insertion after the final line lands at len(lines).
+				pos := h.OldStart + offset
+				pos = clamp(pos, 0, len(lines))
 				return pos, coreStart, coreEnd, nil
 			}
-			// Otherwise this fuzz level is invalid; try the next.
 			continue
 		}
 		lo := expected - opts.MaxOffset
@@ -133,7 +199,6 @@ func locateHunk(lines []string, h *diff.Hunk, offset int, opts ApplyOptions) (st
 			return 0, 0, 0, derr.New(derr.KindAmbiguousMatch,
 				"hunk matches "+itoa(len(matches))+" locations")
 		}
-		// Try whitespace-insensitive if not already.
 		if !opts.IgnoreWhitespace {
 			matches = findPattern(lines, pattern, lo, hi, true)
 			if len(matches) == 1 {

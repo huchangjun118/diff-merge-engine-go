@@ -21,6 +21,7 @@ type MergeResult struct {
 	Content         []string // merged content (conflicts rendered with markers)
 	Conflicts       []Conflict
 	Clean           bool
+	EOL             diff.EOL // line-ending style to render Content with
 	trailingNewline bool
 }
 
@@ -33,6 +34,12 @@ type hunk struct {
 // Merge performs a three-way merge of base, ours and theirs.
 // It is deterministic and order-independent: swapping ours and theirs only
 // swaps the conflict sides, never the conflict set or resolution.
+//
+// Byte-level conventions are resolved deterministically: the rendered EOL
+// style is theirs when the two sides disagree (so re-running the merge with
+// swapped inputs and swapped sides yields the same bytes), and the trailing
+// newline state is taken from the side that changed the tail, defaulting to
+// the base state.
 func Merge(base, ours, theirs string) *MergeResult {
 	baseLines := diff.SplitLines(base)
 	ourLines := diff.SplitLines(ours)
@@ -80,7 +87,53 @@ func Merge(base, ours, theirs string) *MergeResult {
 		content = append(content, ">>>>>>> theirs")
 	}
 
-	return &MergeResult{Content: content, Conflicts: conflicts, Clean: clean, trailingNewline: strings.HasSuffix(base, "\n")}
+	eol, trailing := mergeConventions(base, ours, theirs)
+	return &MergeResult{Content: content, Conflicts: conflicts, Clean: clean, EOL: eol, trailingNewline: trailing}
+}
+
+// mergeConventions picks the output EOL and trailing-newline state without
+// consulting argument order. The trailing state comes from a side that
+// changed it relative to the base; when both change it differently the
+// trailing state remains the base's (the region conflicts textually anyway).
+func mergeConventions(base, ours, theirs string) (diff.EOL, bool) {
+	baseEOL := detectEOL(base)
+	ourEOL := detectEOL(ours)
+	theirEOL := detectEOL(theirs)
+	eol := baseEOL
+	if ourEOL == theirEOL {
+		eol = ourEOL
+	} else if ourEOL != baseEOL {
+		eol = theirEOL
+	} else {
+		eol = ourEOL
+	}
+
+	baseTN := hasTrailing(base)
+	ourTN := hasTrailing(ours)
+	theirTN := hasTrailing(theirs)
+	trailing := baseTN
+	switch {
+	case ourTN == theirTN:
+		trailing = ourTN
+	case ourTN != baseTN:
+		// Only ours changed the tail convention: theirs is still at base.
+		trailing = ourTN
+	case theirTN != baseTN:
+		trailing = theirTN
+	}
+	return eol, trailing
+}
+
+func hasTrailing(s string) bool {
+	return strings.HasSuffix(s, "\n") || strings.HasSuffix(s, "\r")
+}
+
+// detectEOL reports CRLF when the content contains a CRLF sequence.
+func detectEOL(content string) diff.EOL {
+	if strings.Contains(content, "\r\n") {
+		return diff.EOLCRLF
+	}
+	return diff.EOLLF
 }
 
 // diffHunks computes change hunks between base and ver.
@@ -221,14 +274,15 @@ func equalLines(a, b []string) bool {
 	return true
 }
 
-// String renders the merged content with conflict markers.
+// String renders the merged content with conflict markers, using the
+// resolved EOL style and trailing-newline state.
 func (r *MergeResult) String() string {
 	if len(r.Content) == 0 {
 		return ""
 	}
-	s := strings.Join(r.Content, "\n")
+	s := strings.Join(r.Content, r.EOL.Terminator())
 	if r.trailingNewline {
-		s += "\n"
+		s += r.EOL.Terminator()
 	}
 	return s
 }
